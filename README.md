@@ -4,7 +4,8 @@ Exploratory analysis (1 test sample, 1 control) of total proteome and phosphopro
 The workflow includes:
 - data preprocessing
 - fold-change-based expression analysis
-- Gene Ontology enrichment
+- ranked hit lists of proteins and phosphosites
+- gene ontology enrichment
 - data visualisation
 
 Includes an optional sensitivity analysis setting, allowing for parallel analyses to be conducted at differing thresholds.
