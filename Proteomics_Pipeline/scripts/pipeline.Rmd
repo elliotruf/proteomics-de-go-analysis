@@ -1,0 +1,575 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+# ========================
+# User-Defined Parameters
+# ========================
+
+```{r}
+# Fold-change thresholds
+fc_cutoff_primary <- 1.5 # primary analysis, |Log2FC| >= fc_cutoff
+run_sensitivity <- TRUE
+fc_cutoff_sensitivity <- 1 # sensitivity analysis, |Log2FC| >= fc_sens
+
+# Input data file
+data_file <- "HMVEC-D3  MDMAB231 and SKBR3 Artemisinine MS July 2024.xlsx"
+
+# Protein Log2 fold-change column
+protein_fc_col <- "scaled_prot"
+
+# Protein-adjusted phosphosite Log2 fold-change column
+phospho_fc_col <- "adj_scaled_norm_phos"
+
+# Abundance columns for MA plots
+# Protein abundance
+protein_test_col <- "hmvec_d3_art_10" # Test sample
+protein_control_col <- "hmvec_d3_control_10" # Control sample
+
+# Phosphosite abundance
+phospho_test_col <- "hmvec_d3_art_2" # Test sample
+phospho_control_col <- "hmvec_d3_control_2" # Control sample
+
+```
+
+# =====================
+# Pipeline Setup
+# =====================
+
+# Prepare environment and dataset
+```{r}
+# Load modules
+library(tidyverse)
+library(readxl)
+library(here)
+library(janitor)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(conflicted)
+
+# Set conflict preferences
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::slice)
+conflicts_prefer(dplyr::distinct)
+conflicts_prefer(dplyr::add_row)
+
+# Load Data
+raw_df <- read_excel(
+  here("data", data_file),
+  col_names = FALSE
+)
+```
+
+# Clean & Filter Data (w/ column name QC)
+```{r}
+clean_df <- raw_df %>%
+  row_to_names(row_number = 2) %>%
+  clean_names() %>%
+  dplyr::slice(-(1:3)) %>%
+  type.convert(as.is = TRUE)
+
+# Ensure parameter column names match cleaned dataset names
+protein_fc_col <- make_clean_names(protein_fc_col)
+phospho_fc_col <- make_clean_names(phospho_fc_col)
+protein_test_col <- make_clean_names(protein_test_col)
+protein_control_col <- make_clean_names(protein_control_col)
+phospho_test_col <- make_clean_names(phospho_test_col)
+phospho_control_col <- make_clean_names(phospho_control_col)
+
+required_cols <- c(
+  protein_fc_col = protein_fc_col,
+  phospho_fc_col = phospho_fc_col,
+  protein_test_col = protein_test_col,
+  protein_control_col = protein_control_col,
+  phospho_test_col = phospho_test_col,
+  phospho_control_col = phospho_control_col
+)
+
+missing_cols <- names(required_cols)[
+  !required_cols %in% names(clean_df)
+]
+
+if (length(missing_cols) > 0) {
+
+  bad_values <- required_cols[missing_cols]
+
+  msg <- paste(
+    paste0(missing_cols, " -> '", bad_values, "'"),
+    collapse = "\n"
+  )
+
+  stop(
+    "Invalid column parameters:\n\n",
+    msg,
+    call. = FALSE
+  )
+}
+```
+
+# Define helper functions
+```{r}
+# 1. Core Flagging Function
+flag_effect_size <- function(x, fc_cutoff) {
+  !is.na(x) & abs(x) >= fc_cutoff
+}
+ 
+# 2. Protein Flagging Function
+flag_proteins <- function(df, column, fc_cutoff, suffix = "") {
+
+  if (!column %in% names(df)) {
+    stop(paste("Column", column, "not found in dataframe"))
+  }
+
+  col_name <- paste0("prot_sig", suffix)
+  df[[col_name]] <- flag_effect_size(df[[column]], fc_cutoff)
+
+  df
+}
+
+# 3. Phosphosite Flagging Function
+flag_phosphosites <- function(df, column, fc_cutoff, suffix = "") {
+
+  if (!column %in% names(df)) {
+    stop(paste("Column", column, "not found in dataframe"))
+  }
+  
+  col_name <- paste0("phos_sig", suffix)
+  df[[col_name]] <- flag_effect_size(df[[column]], fc_cutoff)
+
+  df
+}
+```
+
+# =======================
+# Create analysis tables
+# =======================
+
+```{r}
+# Select desired columns
+analysis_df <- clean_df %>%
+  select(
+    accession = improved_accession,
+    gene = gene_name,
+    primary_protein_status = protein_pre_improvement_master_status,
+    
+    scaled_prot = all_of(protein_fc_col),
+    adj_scaled_norm_phos = all_of(phospho_fc_col),
+    
+    prot_test = all_of(protein_test_col),
+    prot_control = all_of(protein_control_col),
+    
+    phos_test = all_of(phospho_test_col),
+    phos_control = all_of(phospho_control_col)
+  )
+
+# Filter for master protein entries for protein analysis
+protein_df <- analysis_df %>%
+  filter(primary_protein_status == "IsMasterProtein",
+         !is.na(prot_test),
+         !is.na(prot_control)) %>%
+  distinct(accession, .keep_all = TRUE) %>%
+  mutate(
+    M_prot = scaled_prot,
+    A_prot = (prot_test + prot_control) / 2
+  ) %>%
+  select(accession, gene, scaled_prot, M_prot, A_prot)
+
+# Separate phosphosite df to parallel protein df
+phospho_df <- analysis_df %>%
+  filter(!is.na(phos_test),
+         !is.na(phos_control),
+         !is.na(accession)) %>%
+  mutate(
+    M_phos = adj_scaled_norm_phos,
+    A_phos = (phos_test + phos_control) / 2
+  ) %>%
+  select(accession, gene, adj_scaled_norm_phos, M_phos, A_phos)
+```
+
+# ==================================
+# Preliminary QC & Data Exploration
+# ==================================
+
+# QC Summary Table
+```{r}
+qc_summary <- tibble(
+  metric = c(
+    "Total rows (analysis table)",
+    "Unique proteins",
+    "Protein rows analysed",
+    "Phosphosite rows analysed",
+    "Protein missing (%)",
+    "Phosphosite missing (%)",
+    "Median protein log2FC",
+    "Median phosphosite log2FC",
+    paste0("Proteins exceeding primary FC cutoff (|log2FC| ≥ ", fc_cutoff_primary, ")"),
+    paste0("Phosphosites exceeding primary FC cutoff (|log2FC| ≥ ", fc_cutoff_primary, ")")
+  ),
+  value = c(
+    nrow(analysis_df),
+    n_distinct(protein_df$accession),
+    nrow(protein_df),
+    nrow(phospho_df),
+    round(mean(is.na(analysis_df$scaled_prot)) * 100, 1),
+    round(mean(is.na(analysis_df$adj_scaled_norm_phos)) * 100, 1),
+    round(median(protein_df$scaled_prot, na.rm = TRUE), 3),
+    round(median(phospho_df$adj_scaled_norm_phos, na.rm = TRUE), 3),
+    sum(abs(protein_df$scaled_prot) >= fc_cutoff_primary, na.rm = TRUE),
+    sum(abs(phospho_df$adj_scaled_norm_phos) >= fc_cutoff_primary, na.rm = TRUE)
+  )
+)
+
+if (run_sensitivity) {
+
+  qc_summary <- qc_summary %>%
+    dplyr::add_row(
+      metric = paste0(
+        "Proteins exceeding sensitivity FC cutoff (|log2FC| ≥ ",
+        fc_cutoff_sensitivity,
+        ")"
+      ),
+      value = sum(abs(protein_df$scaled_prot) >= fc_cutoff_sensitivity, na.rm = TRUE)
+    ) %>%
+    dplyr::add_row(
+      metric = paste0(
+        "Phosphosites exceeding sensitivity FC cutoff (|log2FC| ≥ ",
+        fc_cutoff_sensitivity,
+        ")"
+      ),
+      value = sum(abs(phospho_df$adj_scaled_norm_phos) >= fc_cutoff_sensitivity, na.rm = TRUE)
+    )
+
+}
+
+qc_summary
+```
+
+# Protein Distribution
+```{r}
+ggplot(protein_df, aes(x = scaled_prot)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = c(-fc_cutoff_primary, fc_cutoff_primary),
+             linetype = "dashed") +
+  xlim(-5, 5) +
+  theme_minimal() +
+  labs(
+    title = "Protein Log2 Fold Change Distribution",
+    x = "Log2 Fold Change",
+    y = "Count"
+  )
+```
+
+# Phosphosite Distribution
+```{r}
+ggplot(phospho_df, aes(x = adj_scaled_norm_phos)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = c(-fc_cutoff_primary, fc_cutoff_primary),
+             linetype = "dashed") +
+  xlim(-5, 5) +
+  theme_minimal() +
+  labs(
+    title = "Phosphosite Log2 Fold Change Distribution",
+    x = "Log2 Fold Change",
+    y = "Count"
+  )
+```
+
+# ============================================
+# Differential Expression (Fold-Change Based)
+# ============================================
+
+```{r}
+# Primary Analysis
+protein_df <- flag_proteins(
+  protein_df,
+  column = "scaled_prot",
+  fc_cutoff = fc_cutoff_primary,
+  suffix = "_primary"
+)
+
+protein_df <- protein_df %>%
+  mutate(
+    prot_category_primary = case_when(
+      M_prot >= fc_cutoff_primary  ~ "Upregulated",
+      M_prot <= -fc_cutoff_primary ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+phospho_df <- flag_phosphosites(
+  phospho_df,
+  column = "adj_scaled_norm_phos",
+  fc_cutoff = fc_cutoff_primary,
+  suffix = "_primary"
+)
+
+phospho_df <- phospho_df %>%
+  mutate(
+    phos_category_primary = case_when(
+      M_phos >= fc_cutoff_primary  ~ "Upregulated",
+      M_phos <= -fc_cutoff_primary ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+# Sensitivity Analysis
+if (run_sensitivity) {
+
+  protein_df <- flag_proteins(
+    protein_df,
+    column = "scaled_prot",
+    fc_cutoff = fc_cutoff_sensitivity,
+    suffix = "_sens"
+  )
+
+  phospho_df <- flag_phosphosites(
+    phospho_df,
+    column = "adj_scaled_norm_phos",
+    fc_cutoff = fc_cutoff_sensitivity,
+    suffix = "_sens"
+  )
+}
+
+if (run_sensitivity) {
+
+  protein_df <- protein_df %>%
+    mutate(
+      prot_category_sens = case_when(
+        M_prot >= fc_cutoff_sensitivity  ~ "Upregulated",
+        M_prot <= -fc_cutoff_sensitivity ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    )
+
+  phospho_df <- phospho_df %>%
+    mutate(
+      phos_category_sens = case_when(
+        M_phos >= fc_cutoff_sensitivity  ~ "Upregulated",
+        M_phos <= -fc_cutoff_sensitivity ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    )
+
+}
+```
+
+# ======================================
+# MA Plot Generation - Primary Analysis
+# ======================================
+
+# Protein MA Plot
+```{r}
+ggplot(protein_df, aes(x = A_prot, y = M_prot)) +
+
+  # background proteins
+  geom_point(
+    data = subset(protein_df, prot_category_primary == "Not Significant"),
+    colour = "grey60",
+    alpha = 0.4,
+    size = 1.2
+  ) +
+
+  # flagged proteins
+  geom_point(
+    data = subset(protein_df, prot_category_primary != "Not Significant"),
+    aes(color = prot_category_primary),
+    size = 2
+  ) +
+  geom_hline(
+    yintercept = c(-fc_cutoff_primary, fc_cutoff_primary),
+    linetype = "dashed"
+  ) +
+  geom_smooth(method = "loess", se = FALSE, colour = "black", linewidth = 0.5) +
+  scale_color_manual(values = c(
+    "Upregulated" = "#D7191C",
+    "Downregulated" = "#2C7BB6"
+  )) +
+  labs(
+    title = "Protein MA Plot",
+    x = "Mean Log2 Abundance (A)",
+    y = "Log2 Fold Change (M)",
+    color = "Category"
+  ) +
+  theme_minimal()
+```
+
+# Phosphosite MA Plot
+```{r}
+ggplot(phospho_df, aes(x = A_phos, y = M_phos)) +
+
+  geom_point(
+    data = subset(phospho_df, phos_category_primary == "Not Significant"),
+    colour = "grey65",
+    alpha = 0.5,
+    size = 1.2
+  ) +
+
+  geom_point(
+    data = subset(phospho_df, phos_category_primary != "Not Significant"),
+    aes(color = phos_category_primary),
+    size = 2
+  ) +
+
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+
+  geom_hline(
+    yintercept = c(-fc_cutoff_primary, fc_cutoff_primary),
+    linetype = "dashed"
+  ) +
+
+  geom_smooth(method = "loess", se = FALSE, colour = "black", linewidth = 0.5) +
+
+  scale_color_manual(values = c(
+    "Upregulated" = "#D7191C",
+    "Downregulated" = "#2C7BB6"
+  )) +
+
+  labs(
+    title = "Phosphosite MA Plot",
+    x = "Mean Log2 Abundance (A)",
+    y = "Log2 Fold Change (M)",
+    color = "Category"
+  ) +
+  theme_minimal()
+```
+
+# ==========================================
+# MA Plot Generation - Sensitivity Analysis
+# ==========================================
+
+# Protein MA Plot
+```{r}
+ggplot(protein_df, aes(x = A_prot, y = M_prot)) +
+
+  # background proteins
+  geom_point(
+    data = subset(protein_df, prot_category_sens == "Not Significant"),
+    colour = "grey60",
+    alpha = 0.4,
+    size = 1.2
+  ) +
+
+  # flagged proteins
+  geom_point(
+    data = subset(protein_df, prot_category_sens != "Not Significant"),
+    aes(color = prot_category_sens),
+    size = 2
+  ) +
+  geom_hline(
+    yintercept = c(-fc_cutoff_sensitivity, fc_cutoff_sensitivity),
+    linetype = "dashed"
+  ) +
+  geom_smooth(method = "loess", se = FALSE, colour = "black", linewidth = 0.5) +
+  scale_color_manual(values = c(
+    "Upregulated" = "#D7191C",
+    "Downregulated" = "#2C7BB6"
+  )) +
+  labs(
+    title = "Protein MA Plot",
+    x = "Mean Log2 Abundance (A)",
+    y = "Log2 Fold Change (M)",
+    color = "Category"
+  ) +
+  theme_minimal()
+```
+
+# Phosphosite MA Plot
+```{r}
+ggplot(phospho_df, aes(x = A_phos, y = M_phos)) +
+
+  geom_point(
+    data = subset(phospho_df, phos_category_sens == "Not Significant"),
+    colour = "grey65",
+    alpha = 0.5,
+    size = 1.2
+  ) +
+
+  geom_point(
+    data = subset(phospho_df, phos_category_sens != "Not Significant"),
+    aes(color = phos_category_sens),
+    size = 2
+  ) +
+
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+
+  geom_hline(
+    yintercept = c(-fc_cutoff_sensitivity, fc_cutoff_sensitivity),
+    linetype = "dashed"
+  ) +
+
+  geom_smooth(method = "loess", se = FALSE, colour = "black", linewidth = 0.5) +
+
+  scale_color_manual(values = c(
+    "Upregulated" = "#D7191C",
+    "Downregulated" = "#2C7BB6"
+  )) +
+
+  labs(
+    title = "Phosphosite MA Plot",
+    x = "Mean Log2 Abundance (A)",
+    y = "Log2 Fold Change (M)",
+    color = "Category"
+  ) +
+  theme_minimal()
+```
+
+# ====================================
+# Ranked Hit Lists - Primary Analysis
+# ====================================
+
+# Proteins
+```{r}
+protein_hits_primary <- protein_df %>%
+  filter(prot_category_primary != "Not Significant") %>%
+  mutate(effect_size = abs(scaled_prot)) %>%
+  arrange(desc(effect_size)) %>%
+  mutate(rank = row_number()) %>%
+  select(rank, accession, gene, scaled_prot, A_prot, effect_size, prot_category_primary)
+
+protein_hits_primary
+```
+
+# Phosphosites
+```{r}
+phospho_hits_primary <- phospho_df %>%
+  filter(phos_category_primary != "Not Significant") %>%
+  mutate(effect_size = abs(adj_scaled_norm_phos)) %>%
+  arrange(desc(effect_size)) %>%
+  mutate(rank = row_number()) %>%
+  select(rank, accession, gene, adj_scaled_norm_phos, A_phos, effect_size, phos_category_primary)
+
+phospho_hits_primary
+```
+
+# ========================================
+# Ranked Hit Lists - Sensitivity Analysis
+# ========================================
+
+# Proteins
+```{r}
+protein_hits_sens <- protein_df %>%
+  filter(prot_category_sens != "Not Significant") %>%
+  mutate(effect_size = abs(scaled_prot)) %>%
+  arrange(desc(effect_size)) %>%
+  mutate(rank = row_number()) %>%
+  select(rank, accession, gene, scaled_prot, A_prot, effect_size, prot_category_sens)
+
+protein_hits_primary
+```
+
+# Phosphosites
+```{r}
+phospho_hits_sens <- phospho_df %>%
+  filter(phos_category_sens != "Not Significant") %>%
+  mutate(effect_size = abs(adj_scaled_norm_phos)) %>%
+  arrange(desc(effect_size)) %>%
+  mutate(rank = row_number()) %>%
+  select(rank, accession, gene, adj_scaled_norm_phos, A_phos, effect_size, phos_category_sens)
+
+phospho_hits_sens
+```
