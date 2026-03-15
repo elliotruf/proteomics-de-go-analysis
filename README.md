@@ -4,6 +4,8 @@ Exploratory analysis of total proteome and phosphoproteome datasets performed as
 
 This project implements a reproducible R workflow for identifying protein expression changes and interpreting functional changes through Gene Ontology (GO) enrichment.
 
+Note: Due to the exploratory 1:1 sample design, fold-change thresholds were used to identify candidate differentially expressed proteins rather than statistical testing.
+
 ## Workflow
 - Data preprocessing and cleaning
 - Fold-change-based expression comparison
