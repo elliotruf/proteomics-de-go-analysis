@@ -12,12 +12,3 @@ Includes an optional sensitivity analysis setting, allowing for parallel analyse
 Tools used: R, tidyverse, janitor, clusterProfiler, pheatmap, & ggplot2.
 
 !! WORK IN PROGRESS !!
-
-
-
-
-
-Tools used:
-- R
-- limma
-- ggplot2
